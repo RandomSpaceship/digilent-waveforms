@@ -1,0 +1,69 @@
+# Builds every package and runs all checks (`nix flake check`) on each push and
+# pull request, on x86_64-linux and aarch64-linux runners.
+#
+# Qt and the other dependencies come from the Nix binary cache
+# (cache.nixos.org). Our own outputs are unfree, so they are not in that cache,
+# and neither are the upstream .debs. cache-nix-action keeps both in the GitHub
+# Actions cache, so that a run builds only what changed and downloads from
+# files.digilent.com only when a version or hash changes.
+name: check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  flake-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Restores the Nix store of the last run on this system (the newest cache
+      # with this prefix), and saves the store at the end of the job. Before
+      # the save, the action collects garbage down to the size limit. The GC
+      # roots of the last step keep our own outputs and the .debs, and the
+      # garbage collection removes everything else, which the next run
+      # downloads from cache.nixos.org again.
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ matrix.system }}-${{ github.sha }}
+          restore-prefixes-first-match: nix-${{ matrix.system }}-
+          gc-max-store-size-linux: 1G
+          # Remove the older caches of this job, so that only the newest stays.
+          purge: true
+          purge-prefixes: nix-${{ matrix.system }}-
+          purge-created: 0
+          purge-primary-key: never
+
+      - name: Run all checks
+        run: nix flake check --print-build-logs
+
+      # GC roots for our outputs, the checks and the downloaded .debs, so that
+      # the garbage collection before the cache save keeps them. A check whose
+      # inputs did not change is then not run again.
+      - name: Keep our outputs in the cache
+        run: |
+          mkdir -p .gcroots
+          for package in digilent-adept-runtime waveforms; do
+            nix build ".#$package.src" --out-link ".gcroots/src-$package"
+          done
+          for kind in packages checks; do
+            for name in $(nix eval --raw ".#$kind.${{ matrix.system }}" --apply 'set: builtins.concatStringsSep " " (builtins.attrNames set)'); do
+              nix build ".#$kind.${{ matrix.system }}.$name" --out-link ".gcroots/$kind-$name"
+            done
+          done
+          nix path-info -rs .gcroots/* | sort -u | awk '{ total += $2 } END { printf "kept: %.2f GB\n", total / 1e9 }'
